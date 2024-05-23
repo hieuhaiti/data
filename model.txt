@@ -1,0 +1,461 @@
+https://colab.research.google.com/drive/1tk6EIL-PNd7Wyp68UTXfgLBtdDCNDcOW?fbclid=IwZXh0bgNhZW0CMTAAAR19mEhP_P4cUGEWJbHdZW-cOCcIp9hlGdZtvjJMn0lOq2G6DFnJUHiM4x0_aem_ARp39oxAqDDE0nZlFBx0BT54LzK8BnYvFE4xDf5jJHVYAjBrxAMfcHj7tTnRrF6DStLqq1SH6BWQvda_mTBFFS2n
+------------------------------------------------------
+import torch
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+from gensim.utils import simple_preprocess
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import classification_report, confusion_matrix
+
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.utils.data import Dataset, DataLoader
+
+from transformers import get_linear_schedule_with_warmup, AutoTokenizer, AutoModel, logging
+
+import warnings
+warnings.filterwarnings("ignore")
+
+logging.set_verbosity_error()
+------------------------------------------------------
+def seed_everything(seed_value):
+    np.random.seed(seed_value)
+    torch.manual_seed(seed_value)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed_value)
+        torch.cuda.manual_seed_all(seed_value)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
+
+seed_everything(86)
+------------------------------------------------------
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+EPOCHS = 6
+N_SPLITS = 5------------------------------------------------------
+seed_everything(86)
+------------------------------------------------------
+def get_data(path):
+    df = pd.read_excel(path, sheet_name=None)['Sheet1']
+    df.columns = ['title', 'type']
+    return df
+
+train_df = get_data('train.xlsx')
+valid_df = get_data('valid.xlsx')
+test_df = get_data('test.xlsx')
+
+# We will use Kfold later
+train_df = pd.concat([train_df, valid_df], ignore_index=True)
+skf = StratifiedKFold(n_splits=N_SPLITS)
+for fold, (_, val_) in enumerate(skf.split(X=train_df, y=train_df.type)):
+    train_df.loc[val_, "kfold"] = fold
+------------------------------------------------------
+train_df.info(), test_df.info()
+------------------------------------------------------
+sns.countplot(x='type', data=train_df)
+sns.countplot(x='type', data=valid_df)
+sns.countplot(x='type', data=test_df)
+------------------------------------------------------
+tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base", use_fast=False)
+------------------------------------------------------
+class SentimentDataset(Dataset):
+    def __init__(self, df, tokenizer, max_len=120):
+        self.df = df
+        self.max_len = max_len
+        self.tokenizer = tokenizer
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, index):
+        """
+        To customize dataset, inherit from Dataset class and implement
+        __len__ & __getitem__
+        __getitem__ should return
+            data:
+                input_ids
+                attention_masks
+                text
+                targets
+        """
+        row = self.df.iloc[index]
+        text, label = self.get_input_data(row)
+
+        # Encode_plus will:
+        # (1) split text into token
+        # (2) Add the '[CLS]' and '[SEP]' token to the start and end
+        # (3) Truncate/Pad sentence to max length
+        # (4) Map token to their IDS
+        # (5) Create attention mask
+        # (6) Return a dictionary of outputs
+        encoding = self.tokenizer.encode_plus(
+            text,
+            truncation=True,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            return_attention_mask=True,
+            return_token_type_ids=False,
+            return_tensors='pt',
+        )
+
+        return {
+            'text': text,
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_masks': encoding['attention_mask'].flatten(),
+            'targets': torch.tensor(label, dtype=torch.long),
+        }
+
+
+    def labelencoder(self,text):
+        if text=='Ô nhiễm tiếng ồn':
+            return 0
+        elif text=='Ô nhiễm nước':
+            return 1
+        elif text=='Ô nhiễm không khí':
+            return 2
+        elif text=='Ô nhiễm đất':
+            return 3
+        else:
+            return 4
+
+    def get_input_data(self, row):
+        # Preprocessing: {remove icon, special character, lower}
+        text = row['title']
+        text = ' '.join(simple_preprocess(text))
+        label = self.labelencoder(row['type'])
+
+        return text, label
+------------------------------------------------------
+# Distribution of length of Sentence
+all_data = train_df.title.tolist() + test_df.title.tolist()
+all_data = [' '.join(simple_preprocess(text)) for text in all_data]
+encoded_text = [tokenizer.encode(text, add_special_tokens=True) for text in all_data]
+token_lens = [len(text) for text in encoded_text]
+sns.displot(token_lens)
+plt.xlim([0,max(token_lens)])
+plt.xlabel('Token Count')
+------------------------------------------------------
+class SentimentClassifier(nn.Module):
+    def __init__(self, n_classes):
+        super(SentimentClassifier, self).__init__()
+        self.bert = AutoModel.from_pretrained("vinai/phobert-base")
+        self.drop = nn.Dropout(p=0.3)
+        self.fc = nn.Linear(self.bert.config.hidden_size, n_classes)
+        nn.init.normal_(self.fc.weight, std=0.02)
+        nn.init.normal_(self.fc.bias, 0)
+
+    def forward(self, input_ids, attention_mask):
+        last_hidden_state, output = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            return_dict=False # Dropout will errors if without this
+        )
+
+        x = self.drop(output)
+        x = self.fc(x)
+        return x
+------------------------------------------------------
+def train(model, criterion, optimizer, train_loader):
+    model.train()
+    losses = []
+    correct = 0
+
+    for data in train_loader:
+        input_ids = data['input_ids'].to(device)
+        attention_mask = data['attention_masks'].to(device)
+        targets = data['targets'].to(device)
+
+        optimizer.zero_grad()
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        loss = criterion(outputs, targets)
+        _, pred = torch.max(outputs, dim=1)
+
+        correct += torch.sum(pred == targets)
+        losses.append(loss.item())
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        lr_scheduler.step()
+
+    print(f'Train Accuracy: {correct.double()/len(train_loader.dataset)} Loss: {np.mean(losses)}')
+
+def eval(test_data = False):
+    model.eval()
+    losses = []
+    correct = 0
+
+    with torch.no_grad():
+        data_loader = test_loader if test_data else valid_loader
+        for data in data_loader:
+            input_ids = data['input_ids'].to(device)
+            attention_mask = data['attention_masks'].to(device)
+            targets = data['targets'].to(device)
+
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+
+            _, pred = torch.max(outputs, dim=1)
+
+            loss = criterion(outputs, targets)
+            correct += torch.sum(pred == targets)
+            losses.append(loss.item())
+
+    if test_data:
+        print(f'Test Accuracy: {correct.double()/len(test_loader.dataset)} Loss: {np.mean(losses)}')
+        return correct.double()/len(test_loader.dataset)
+    else:
+        print(f'Valid Accuracy: {correct.double()/len(valid_loader.dataset)} Loss: {np.mean(losses)}')
+        return correct.double()/len(valid_loader.dataset)
+------------------------------------------------------
+def prepare_loaders(df, fold):
+    df_train = df[df.kfold != fold].reset_index(drop=True)
+    df_valid = df[df.kfold == fold].reset_index(drop=True)
+
+    train_dataset = SentimentDataset(df_train, tokenizer, max_len=120)
+    valid_dataset = SentimentDataset(df_valid, tokenizer, max_len=120)
+
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=2)
+    valid_loader = DataLoader(valid_dataset, batch_size=16, shuffle=True, num_workers=2)
+
+    return train_loader, valid_loader
+------------------------------------------------------
+for fold in range(skf.n_splits):
+    print(f'-----------Fold: {fold+1} ------------------')
+    train_loader, valid_loader = prepare_loaders(train_df, fold=fold)
+    model = SentimentClassifier(n_classes=5).to(device)
+    criterion = nn.CrossEntropyLoss()
+    # Recommendation by BERT: lr: 5e-5, 2e-5, 3e-5
+    # Batchsize: 16, 32
+    optimizer = AdamW(model.parameters(), lr=2e-5)
+
+    lr_scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=0,
+                num_training_steps=len(train_loader)*EPOCHS
+            )
+    best_acc = 0
+    for epoch in range(EPOCHS):
+        print(f'Epoch {epoch+1}/{EPOCHS}')
+        print('-'*30)
+
+        train(model, criterion, optimizer, train_loader)
+        val_acc = eval()
+
+        if val_acc > best_acc:
+            torch.save(model.state_dict(), f'phobert_fold{fold+1}.pth')
+            best_acc = val_acc
+------------------------------------------------------
+def test(data_loader):
+    models = []
+    for fold in range(skf.n_splits):
+        model = SentimentClassifier(n_classes=5)
+        model.to(device)
+        model.load_state_dict(torch.load(f'phobert_fold{fold+1}.pth'))
+        model.eval()
+        models.append(model)
+
+    texts = []
+    predicts = []
+    predict_probs = []
+    real_values = []
+
+    for data in data_loader:
+        text = data['text']
+        input_ids = data['input_ids'].to(device)
+        attention_mask = data['attention_masks'].to(device)
+        targets = data['targets'].to(device)
+
+        total_outs = []
+        for model in models:
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
+                )
+                total_outs.append(outputs)
+
+        total_outs = torch.stack(total_outs)
+        _, pred = torch.max(total_outs.mean(0), dim=1)
+        texts.extend(text)
+        predicts.extend(pred)
+        predict_probs.extend(total_outs.mean(0))
+        real_values.extend(targets)
+
+    predicts = torch.stack(predicts).cpu()
+    predict_probs = torch.stack(predict_probs).cpu()
+    real_values = torch.stack(real_values).cpu()
+    print(classification_report(real_values, predicts))
+    return real_values, predicts
+------------------------------------------------------
+test_dataset = SentimentDataset(test_df, tokenizer, max_len=50)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=True, num_workers=2)
+real_values, predicts = test(test_loader)
+------------------------------------------------------
+class_names = ['Ô nhiễm tiếng ồn', 'Ô nhiễm không khí', 'Ô nhiễm nước', 'Ô nhiễm đất']
+sns.heatmap(confusion_matrix(real_values, predicts), annot=False, xticklabels = class_names, yticklabels = class_names)
+------------------------------------------------------
+def check_wrong(real_values, predicts):
+    wrong_arr = []
+    wrong_label = []
+    for i in range(len(predicts)):
+        if predicts[i] != real_values[i]:
+            wrong_arr.append(i)
+            wrong_label.append(predicts[i])
+    return wrong_arr, wrong_label
+
+print(check_wrong(real_values, predicts))
+
+for i in range(1):
+    print('-'*50)
+    wrong_arr, wrong_label = check_wrong(real_values, predicts)
+    print(test_df.iloc[wrong_arr[i]].title)
+    print(f'Predicted: ({class_names[wrong_label[i]]}) --vs-- Real label: ({class_names[real_values[wrong_arr[i]]]})')
+------------------------------------------------------
+def infer(text, tokenizer, max_len=120):
+    encoded_review = tokenizer.encode_plus(
+        text,
+        max_length=max_len,
+        truncation=True,
+        add_special_tokens=True,
+        padding='max_length',
+        return_attention_mask=True,
+        return_token_type_ids=False,
+        return_tensors='pt',
+    )
+
+    input_ids = encoded_review['input_ids'].to(device)
+    attention_mask = encoded_review['attention_mask'].to(device)
+
+    output = model(input_ids, attention_mask)
+    _, y_pred = torch.max(output, dim=1)
+
+    print(f'Text: {text}')
+    print(f'Sentiment: {class_names[y_pred]}')
+------------------------------------------------------
+infer('Hiệu quả của công nghệ xử lý nước trong giảm ô nhiễm', tokenizer)
+------------------------------------------------------
+try:
+  %tensorflow_version 2.x
+except Exception:
+  pass
+------------------------------------------------------
+import json
+import tensorflow as tf
+
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+------------------------------------------------------
+vocab_size = 851
+embedding_dim = 16
+max_length = 100
+trunc_type='post'
+padding_type='post'
+oov_tok = "<OOV>"
+training_size = 500
+
+------------------------------------------------------
+with open("env.json", 'r') as f:
+    datastore = json.load(f)
+
+sentences = []
+labels = []
+
+for item in datastore:
+    sentences.append(item['headline'])
+    labels.append(item['is_positive'])
+------------------------------------------------------
+training_sentences = sentences[0:training_size]
+testing_sentences = sentences[training_size:]
+training_labels = labels[0:training_size]
+testing_labels = labels[training_size:]
+------------------------------------------------------
+# Need this block to get it to work with TensorFlow 2.x
+import numpy as np
+training_padded = np.array(training_padded)
+training_labels = np.array(training_labels)
+testing_padded = np.array(testing_padded)
+testing_labels = np.array(testing_labels)
+------------------------------------------------------
+model = tf.keras.Sequential([
+    tf.keras.layers.Embedding(vocab_size, embedding_dim, input_length=max_length),
+    tf.keras.layers.GlobalAveragePooling1D(),
+    tf.keras.layers.Dense(24, activation='relu'),
+    tf.keras.layers.Dense(1, activation='sigmoid')
+])
+model.compile(loss='binary_crossentropy',optimizer='adam',metrics=['accuracy'])
+------------------------------------------------------
+model.summary()
+------------------------------------------------------
+num_epochs = 100
+history = model.fit(training_padded, training_labels, epochs=num_epochs, validation_data=(testing_padded, testing_labels), verbose=2)
+------------------------------------------------------
+import matplotlib.pyplot as plt
+
+
+def plot_graphs(history, string):
+  plt.plot(history.history[string])
+  plt.plot(history.history['val_'+string])
+  plt.xlabel("Epochs")
+  plt.ylabel(string)
+  plt.legend([string, 'val_'+string])
+  plt.show()
+
+plot_graphs(history, "accuracy")
+plot_graphs(history, "loss")
+------------------------------------------------------
+reverse_word_index = dict([(value, key) for (key, value) in word_index.items()])
+
+def decode_sentence(text):
+    return ' '.join([reverse_word_index.get(i, '?') for i in text])
+
+print(decode_sentence(training_padded[0]))
+print(training_sentences[2])
+print(labels[2])
+------------------------------------------------------
+e = model.layers[0]
+weights = e.get_weights()[0]
+print(weights.shape) # shape: (vocab_size, embedding_dim)
+
+------------------------------------------------------
+import io
+
+out_v = io.open('vecs.tsv', 'w', encoding='utf-8')
+out_m = io.open('meta.tsv', 'w', encoding='utf-8')
+for word_num in range(1, vocab_size):
+  word = reverse_word_index[word_num]
+  embeddings = weights[word_num]
+  out_m.write(word + "\n")
+  out_v.write('\t'.join([str(x) for x in embeddings]) + "\n")
+out_v.close()
+out_m.close()
+------------------------------------------------------
+try:
+  from google.colab import files
+except ImportError:
+  pass
+else:
+  files.download('vecs.tsv')
+  files.download('meta.tsv')
+------------------------------------------------------
+sentence = [
+"Miền Trung mưa lớn, cảnh báo nguy cơ lũ quét, sạt lở đất"
+]
+sequences = tokenizer.texts_to_sequences(sentence)
+padded = pad_sequences(sequences, maxlen=max_length, padding=padding_type, truncating=trunc_type)
+print(model.predict(padded))
+count = 0
+for i in model.predict(padded):
+  if i>0.5:
+    count = count +1
+
+print(count)
